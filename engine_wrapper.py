@@ -1,9 +1,13 @@
+import sys
+import threading
 import os
 import chess
 import chess.xboard
 import chess.uci
 import backoff
 import subprocess
+import socket
+
 
 @backoff.on_exception(backoff.expo, BaseException, max_time=120)
 def create_engine(config, board):
@@ -48,9 +52,10 @@ class EngineWrapper:
         self.engine.quit()
 
     def print_handler_stats(self, info, stats):
-        for stat in stats:
-            if stat in info:
-                print("    {}: {}".format(stat, info[stat]))
+        #for stat in stats:
+        #    if stat in info:
+        #        print("    {}: {}".format(stat, info[stat]))
+        pass
 
     def get_handler_stats(self, info, stats):
         stats_str = []
@@ -61,13 +66,105 @@ class EngineWrapper:
         return stats_str
 
 
+class EngineCommProcess:
+    def __init__(self, engine, **kwargs):
+        self.engine = engine
+
+        self._receiving_thread = threading.Thread(
+            target=self._receiving_thread_target)
+        self._receiving_thread.daemon = True
+        self._stdin_lock = threading.Lock()
+
+        self.engine.on_process_spawned(self)
+        self.engine_connected_cv = threading.Condition()
+        self.engine_connected = threading.Event()
+
+        self._receiving_thread.start()
+
+    @backoff.on_exception(backoff.constant, BaseException, interval=10)
+    def _receiving_thread_target(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print("Trying to connect...")
+        self.sock.connect(('localhost', 12345))
+        print("Connected!")
+        self.engine_connected.set()
+
+        with self.engine_connected_cv:
+            self.engine_connected_cv.notify_all()
+
+        while True:
+            lines = self.sock.recv(2048).decode("utf-8")
+            if len(lines) == 0:
+                break
+            for line in lines.split("\n"):
+                print("RECV:", line)
+                self.engine.on_line_received(line)
+
+        with self._stdin_lock:
+            self.terminate()
+        self.engine.on_terminated()
+
+        # Close file descriptors.
+        #self.process.stdout.close()
+        #with self._stdin_lock:
+        #    self.process.stdin.close()
+
+        # Ensure the process is terminated (not just the in/out streams).
+        #if self.is_alive():
+        #    self.terminate()
+        #    self.wait_for_return_code()
+
+        #self.engine.on_terminated()
+
+    def is_alive(self):
+        return True
+
+    def terminate(self):
+        self.engine_connected.clear()
+        with self.engine_connected_cv:
+            self.engine_connected_cv.notify_all()
+        self.sock.close()
+        pass  # self.process.terminate()
+
+    def kill(self):
+        pass  # self.process.kill()
+
+    @backoff.on_exception(backoff.constant, BaseException, interval=10)
+    def send_line(self, string):
+        while not self.engine_connected.is_set():
+            print("engine not connected. waiting for connection...")
+            with self.engine_connected_cv:
+                self.engine_connected_cv.wait()
+                if self.engine_connected.is_set():
+                    print("Shutting")
+                    return
+                print("engine connected!")
+        with self._stdin_lock:
+            self.sock.sendall((string + "\n").encode())
+            print("sent:", string)
+
+    def wait_for_return_code(self):
+        #self.process.wait()
+        return 0  # self.process.returncode
+
+    def pid(self):
+        return 0  # self.process.pid
+
+    def __repr__(self):
+        return "<EngineCommProcess at {} (pid={})>".format(hex(id(self)), self.pid())
+
+
 class UCIEngine(EngineWrapper):
 
     def __init__(self, board, commands, options, silence_stderr=False):
         commands = commands[0] if len(commands) == 1 else commands
         self.go_commands = options.get("go_commands", {})
 
-        self.engine = chess.uci.popen_engine(commands, stderr = subprocess.DEVNULL if silence_stderr else None)
+        self.engine = chess.uci.Engine()
+        EngineCommProcess(self.engine)
+        info_handler = chess.uci.InfoHandler()
+        self.engine.info_handlers.append(info_handler)
+
         self.engine.uci()
 
         if options:
@@ -78,10 +175,6 @@ class UCIEngine(EngineWrapper):
             "UCI_Chess960": board.chess960
         })
         self.engine.position(board)
-
-        info_handler = chess.uci.InfoHandler()
-        self.engine.info_handlers.append(info_handler)
-
 
     def first_search(self, board, movetime):
         self.engine.position(board)
@@ -97,7 +190,7 @@ class UCIEngine(EngineWrapper):
             binc=binc,
             ponder=ponder
         )
-        return ( best_move , ponder_move )
+        return (best_move, ponder_move)
 
     def search(self, board, wtime, btime, winc, binc):
         self.engine.position(board)
@@ -113,14 +206,12 @@ class UCIEngine(EngineWrapper):
         )
         return best_move
 
-
     def stop(self):
         self.engine.stop()
 
-
     def print_stats(self):
-        self.print_handler_stats(self.engine.info_handlers[0].info, ["string", "depth", "nps", "nodes", "score"])
-
+        self.print_handler_stats(self.engine.info_handlers[0].info, [
+                                 "string", "depth", "nps", "nodes", "score"])
 
     def get_stats(self):
         return self.get_handler_stats(self.engine.info_handlers[0].info, ["depth", "nps", "nodes", "score"])
@@ -130,7 +221,8 @@ class XBoardEngine(EngineWrapper):
 
     def __init__(self, board, commands, options=None, silence_stderr=False):
         commands = commands[0] if len(commands) == 1 else commands
-        self.engine = chess.xboard.popen_engine(commands, stderr = subprocess.DEVNULL if silence_stderr else None)
+        self.engine = chess.xboard.popen_engine(
+            commands, stderr=subprocess.DEVNULL if silence_stderr else None)
 
         self.engine.xboard()
 
@@ -203,11 +295,11 @@ class XBoardEngine(EngineWrapper):
         return self.search(board, wtime, btime, winc, binc), None
 
     def print_stats(self):
-        self.print_handler_stats(self.engine.post_handlers[0].post, ["depth", "nodes", "score"])
+        self.print_handler_stats(self.engine.post_handlers[0].post, [
+                                 "depth", "nodes", "score"])
 
     def get_stats(self):
         return self.get_handler_stats(self.engine.post_handlers[0].post, ["depth", "nodes", "score"])
-
 
     def name(self):
         try:
