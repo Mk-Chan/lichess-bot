@@ -1,3 +1,8 @@
+# Custom lichess-bot
+This branch (socket-engine) of lichess-bot is meant to work with engines across a socket.
+Primarily useful for applications where decoupling the engine provider from the lichess-bot process
+is useful for example: [IRC Votechess](https://github.com/Mk-Chan/votechess-bot)
+
 # lichess-bot
 A bridge between [Lichess API](https://lichess.org/api#tag/Chess-Bot) and bots.
 
